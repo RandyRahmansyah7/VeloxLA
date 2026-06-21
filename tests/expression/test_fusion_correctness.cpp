@@ -1,0 +1,7 @@
+#include <catch2/catch_test_macros.hpp>
+#include <veloxla/veloxla.hpp>
+
+TEST_CASE("Fusion correctness vs naive eval — placeholder", "[placeholder]") {
+    // TODO: tulis test case sesuai roadmap.
+    REQUIRE(true);
+}
