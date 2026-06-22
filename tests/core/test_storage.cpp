@@ -2,6 +2,8 @@
 #include <veloxla/veloxla.hpp>
 #include <string>
 #include <iterator>
+#include <numeric>
+#include <algorithm>
 
 using veloxla::Storage;
 
@@ -27,6 +29,18 @@ TEST_CASE("Storage fill construction sets all elements", "[storage]") {
     for(std::size_t i = 0; i < s.size(); ++i) {
         REQUIRE(s[i] == 7);
     }
+}
+
+TEST_CASE("Storage zero sized contruction", "[Storage]") {
+    // Branch coverage for `allocate(0)` → `nullptr` (see `storage.hpp`).
+    // Without this test, the branch n == 0 in allocate() is never executed
+    // by the test suite at all.
+
+    Storage<int> s(0);
+
+    REQUIRE(s.size() == 0);
+    REQUIRE(s.empty());
+    REQUIRE(s.data() == nullptr);
 }
 
 TEST_CASE("Storage operator[] allows read and write", "[storage]") {
@@ -56,14 +70,52 @@ TEST_CASE("Storage move constructor transfers ownership", "[storage]") {
     REQUIRE(b.size() == 3);
     REQUIRE(b.data() == original_ptr);
     REQUIRE(b[0] == 42);
-
+    
+    // The source must be in a valid empty state after being moved from.
     REQUIRE(a.size() == 0);
     REQUIRE(a.data() == nullptr);
 }
 
-TEST_CASE("Storage move assignment releases old buffer and nulls source", "[storage]") {
+TEST_CASE("Storage move construct from empty storage", "[storage]") {
+    // Edge case: the source itself is already empty (data_ == nullptr).
+    // Make sure the move constructor doesn't wrongly assume data_ is always non-null.
+    
+    Storage<int> a;
+
+    Storage<int> b(std::move(a));
+
+    REQUIRE(b.empty());
+    REQUIRE(b.data() == nullptr);
+
+    REQUIRE(a.empty());
+    REQUIRE(a.data() == nullptr);
+}
+
+TEST_CASE("Storage move assignment from empty storage releases destination buffer", "[storage]") {
+    // The opposite of the existing move-assignment test: here’s the SOURCE
+    // (b) which is empty, not the goal. This validates destroy_all() +
+    // deallocate() is still correctly called on a's OLD buffer even though
+    // hasil akhirnya a jadi kosong juga.
     Storage<int> a(10, 1);
-    Storage<int> b(3, 99);
+    Storage<int> b;
+
+    a = std::move(b);
+
+    REQUIRE(a.empty());
+    REQUIRE(a.size() == 0);
+    REQUIRE(a.data() == nullptr);
+    
+}
+
+TEST_CASE("Storage move assignment releases old buffer and nulls source", "[storage]") {
+    // This test specifically catches a bug that used to exist when
+    // operator=(Storage&&) is declared = default: no implementation
+    // manual, old buffer *this leaks (never deallocated) and
+    // other.data_ wasn't set to null, causing a double free when the destructor runs
+    // other terpanggil di akhir scope test ini.
+
+    Storage<int> a(10, 1);  // A's old buffer — must be released when move-assigning
+    Storage<int> b(3, 99);  // sumber yang akan di-move
 
     int* b_ptr = b.data();
 
@@ -73,8 +125,15 @@ TEST_CASE("Storage move assignment releases old buffer and nulls source", "[stor
     REQUIRE(a.data() == b_ptr);
     REQUIRE(a[0] == 99);
 
+    // b has to be a valid empty state — if not, b's destructor will
+    // the end of the scope will try to deallocate the pointer that has already been moved to a,
+    // alias double free.
     REQUIRE(b.size() == 0);
     REQUIRE(b.data() == nullptr);
+
+    // The scope ends here: destructors a and b run. If there is
+    // double-free or leak, the sanitizer (ASan) will catch it when
+    // run with -fsanitize=address.
 }
 
 TEST_CASE("Storage move assignment to self is a no-op", "[storage]") {
