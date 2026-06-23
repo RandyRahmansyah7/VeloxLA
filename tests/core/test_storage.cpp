@@ -139,6 +139,12 @@ TEST_CASE("Storage move assignment releases old buffer and nulls source", "[stor
 TEST_CASE("Storage move assignment to self is a no-op", "[storage]") {
     Storage<int> a(3, 5);
     int* ptr_before = a.data();
+    
+
+    // Self-move assignment must be safe: no crashes, no state corruption.
+    // Use an alias pointer so the compiler doesn't warn -Wself-move about
+    // "a = std::move(a)" literally — but still test the same code path
+    // (operator= called with this == &other).
 
     Storage<int>& self_ref = a;
     a = std::move(self_ref);
@@ -148,6 +154,9 @@ TEST_CASE("Storage move assignment to self is a no-op", "[storage]") {
 }
 
 TEST_CASE("Storage works with non-trivial type (std::string)", "[storage]") {
+    // Validate construct_all/destroy_all correctly for types with destructors
+    // non-trivial — if there's a bug in the construct/destroy pairing, this will
+    // crash or leak that appears in the sanitizer.
     Storage<std::string> s(3, std::string("hello"));
 
     REQUIRE(s.size() == 3);
@@ -160,6 +169,8 @@ TEST_CASE("Storage works with non-trivial type (std::string)", "[storage]") {
 }
 
 TEST_CASE("Storage is not copyable", "[storage]") {
+    // This is a static_assert, not a runtime check — it just makes sure this code
+    // compiles and REQUIRE(true) as a placeholder assertion.
     STATIC_REQUIRE_FALSE(std::is_copy_constructible_v<Storage<int>>);
     STATIC_REQUIRE_FALSE(std::is_copy_assignable_v<Storage<int>>);
     REQUIRE(true);
@@ -173,7 +184,8 @@ TEST_CASE("Storage swap exchanges buffers without copying", "[storage]") {
     int* b_ptr = b.data();
 
     a.swap(b);
-
+    
+    // After the swap, the pointers really have to be swapped (not a deep copy).
     REQUIRE(a.data() == b_ptr);
     REQUIRE(b.data() == a_ptr);
     REQUIRE(a.size() == 5);
@@ -194,7 +206,8 @@ TEST_CASE("Storage iterators cover the full range in order", "[storage]") {
     REQUIRE(s[1] == 1);
     REQUIRE(s[2] == 2);
     REQUIRE(s[3] == 3);
-
+    
+    // Range-based for loops must work through the same begin()/end().
     int sum = 0;
     for(int v : s) {
         sum += v;
@@ -224,11 +237,86 @@ TEST_CASE("Storage constructed with explicit allocator instance", "[storage]") {
     }
 }
 
-TEST_CASE("Storage fill() sets all elements to given value", "[storage]") {
-    Storage<int> s(5);
-    s.fill(42);
 
-    for(std::size_t i = 0; i < s.size(); ++i) {
-        REQUIRE(s[i] == 42);
+namespace {
+// Helper type that intentionally throws an exception on the N-th construction to
+// validate the exception safety of construct_all(): if any element
+// fails to be constructed halfway, the elements that have ALREADY been constructed
+// before must be destroyed in reverse order, and the buffer must be deallocated —
+// no partially-constructed objects should leak.
+//
+// Counter is manually reset at the start of each TEST_CASE that uses it (not
+// through static init constructor) because Catch2 runs all
+// TEST_CASEs in the same process; without reset, the state of test
+// previously it will leak to the next test and cause the results to be inaccurate
+// deterministic depending on the execution order.
+struct ThrowingType
+{
+    static int contruction_count;
+    static int throw_after_n;
+
+    ThrowingType()
+    {
+        if(contruction_count++ == throw_after_n)
+        {
+            throw std::runtime_error("ThrowingType: simulated construction failure");
+        }
     }
+
+    ~ThrowingType() = default;
+};
+
+int ThrowingType::contruction_count = 0;
+int ThrowingType::throw_after_n = 0;
+
+}  // namespace
+
+TEST_CASE("Storage construct_all rolls back partially constructed elements on exception", "[storage]") {
+    ThrowingType::contruction_count = 0;
+    ThrowingType::throw_after_n = 3;       // the 4th element (index 3) that will throw
+
+    // If construct_all() does NOT roll back correctly (destroying elements
+    // [0, i) that were successfully constructed before the exception, then
+    // deallocating the buffer), elements 0,1,2 that have been constructed will
+    // leak — both as a memory leak (buffer is never freed) and as an object
+    // leak (destructors for 0,1,2 are never called). This test itself only
+    // verifies that the exception is actually thrown and propagates to the caller;
+    // CONFIRMATION that there are no leaks is only valid when this binary is run
+    // under AddressSanitizer/LeakSanitizer (see the sanitizer workflow in
+    // scripts/profile_perf.sh or run manually with ASAN_OPTIONS=detect_leaks=1).
+
+    REQUIRE_THROWS_AS(Storage<ThrowingType>(10), std::runtime_error);
+}
+
+TEST_CASE("Storage construct_all succeeds when no exception is thrown", "[storage]") {
+    // Sanity check companion for the test above: make sure ThrowingType
+    // itself is not wrongly designed — if throw_after_n is set outside
+    // the construction range, all elements are constructed successfully.
+
+    ThrowingType::contruction_count = 0;
+    ThrowingType::throw_after_n = 100;     // will never be achieved for small sizes
+
+    REQUIRE_NOTHROW(storage<ThrowingType>(5));
+}
+
+TEST_CASE("Storage works with STL algorithms (std::accumulate)", "[storage]") {
+    // The tensor engine will frequently use STL algorithms over the Storage
+    // range (reduction, transform, etc.) — this test validates that
+    // begin()/end() strictly satisfy the LegacyForwardIterator contract
+    // required by std::accumulate and similar STL algorithms.
+
+    storage<int> s(5,1);
+
+    int sum = std::accumulate(s.begin(). s.end(), 0);
+
+    REQUIRE(sum == 5);
+}
+
+TEST_CASE("Storage works with STL algorithms (std::fill and std::count)", "[storage]") {
+    Storage<int> s(6, 0);
+
+    std::fill(s.begin(), s.end(), 3);
+    auto count = std::count(s.begin(), s.end(), 3);
+
+    REQUIRE(count == 6);
 }
